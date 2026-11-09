@@ -734,6 +734,14 @@ void Function::unroll(unsigned k) {
       UNREACHABLE();
     };
 
+    // predecessors of each block in the final CFG, used to check whether a
+    // merge phi at an exit destination has an entry for every incoming edge
+    unordered_map<const BasicBlock*, vector<const BasicBlock*>> preds;
+    for (auto *bb : getBBs()) {
+      for (auto &dst : bb->targets())
+        preds[&dst].emplace_back(bb);
+    }
+
     // patch users outside of the loop
     for (auto &[val, copies] : vmap) {
       auto I = users.find(val);
@@ -742,10 +750,80 @@ void Function::unroll(unsigned k) {
 
       BasicBlock *bb_val = bb_of(val);
 
+      // An exit slot is an alloca in the entry block that stores the value
+      // right after its definition and after the definition of each unrolled
+      // copy, so that a use outside the loop can load the value of the last
+      // executed copy. The definition dominates the use, so the slot is
+      // always written before it is read.
+      Alloc *exit_slot = nullptr;
+      auto get_exit_slot = [&]() -> Alloc& {
+        if (exit_slot)
+          return *exit_slot;
+
+        static PtrType ptr_type(0);
+        static IntType i32(string("i32"), 32);
+        auto &type = val->getType();
+        auto size_alloc
+          = make_unique<IntConst>(i32, Memory::getStoreByteSize(type));
+        auto *size = size_alloc.get();
+        addConstant(std::move(size_alloc));
+
+        unsigned align = 16;
+        auto name = val->getName() + "#ptr#" + to_string(phi_counter++);
+        auto alloca = make_unique<Alloc>(ptr_type, string(name), *size,
+                                         nullptr, align);
+        exit_slot = alloca.get();
+
+        auto store_after_def = [&](auto *bb, const auto *v) {
+          auto st = make_unique<Store>(*exit_slot,
+                                       *const_cast<Value*>(v), align);
+          // keep phis at the beginning of the block
+          if (dynamic_cast<const Phi*>(v)) {
+            auto phis = bb->phis();
+            assert(!phis.empty());
+            bb->addInstrAt(std::move(st), phis.back(), false);
+          } else {
+            bb->addInstrAt(std::move(st), static_cast<const Instr*>(v),
+                           false);
+          }
+        };
+
+        store_after_def(bb_val, val);
+        for (auto &[bb, v] : copies) {
+          store_after_def(bb, v);
+        }
+
+        getFirstBB().addInstr(std::move(alloca), true);
+        return *exit_slot;
+      };
+
       for (auto &[user, user_bb] : I->second) {
         // users inside the loop have been patched already
         if (bbmap.count(user_bb))
           continue;
+
+        auto *phi = dynamic_cast<Phi*>(user);
+
+        if (phi) {
+          // A phi reads the value through its incoming edges. Entries whose
+          // predecessor is a loop exit block are extended with the exit's
+          // copies below. Entries through blocks outside the loop would keep
+          // reading the original definition, which after unrolling is the
+          // first copy's value and is stale on paths that leave the loop
+          // from a later copy; they read the exit slot with a load at the
+          // end of the predecessor block, which the edge always executes
+          // after the last store.
+          for (auto &[pv, pred] : phi->getValues()) {
+            if (pv != val || bbmap.count(&getBB(pred)))
+              continue;
+            auto load = make_unique<Load>(val->getType(),
+                              val->getName() + "#ld#" + to_string(phi_counter++),
+                              get_exit_slot(), 16);
+            phi->replace(pred, *load.get());
+            getBB(pred).addInstrAt(std::move(load), &getBB(pred).back(),
+                                   true);
+          }
+        }
 
         // insert a new phi on each dominator exit
         set<pair<BasicBlock*, Phi*>> added_phis;
@@ -755,8 +833,10 @@ void Function::unroll(unsigned k) {
           if (!dom_tree.dominates(bb_val, exit))
             continue;
 
-          if (auto phi = dynamic_cast<Phi*>(user);
-              phi && user_bb == dst) {
+          if (phi) {
+            if (user_bb != dst)
+              continue;
+
             // Check if the phi uses this value through this predecessor
             auto &vals = phi->getValues();
             auto *used_val = val;
@@ -801,13 +881,7 @@ void Function::unroll(unsigned k) {
             }
           }
 
-          if (auto phi = dynamic_cast<Phi*>(user)) {
-            for (auto &[pv, pred] : phi->getValues()) {
-              if (pv == val && dom_tree.dominates(dst, &getBB(pred))){
-                phi->replace(pred, *newphi);
-              }
-            }
-          } else if (dynamic_cast<Instr*>(user)) {
+          if (dynamic_cast<Instr*>(user)) {
             user->rauw(*val, *newphi);
             added_phis.emplace(dst, newphi);
             if (!first_added_phi)
@@ -815,40 +889,35 @@ void Function::unroll(unsigned k) {
           }
         }
 
-        // We have more than 1 dominating exit
-        // add load/stores to avoid complex SSA building algorithms
-        if (added_phis.size() > 1) {
-          static PtrType ptr_type(0);
-          static IntType i32(string("i32"), 32);
-          auto &type = val->getType();
-          auto size_alloc
-            = make_unique<IntConst>(i32, Memory::getStoreByteSize(type));
-          auto *size = size_alloc.get();
-          addConstant(std::move(size_alloc));
-
-          unsigned align = 16;
-          auto name = val->getName() + "#ptr#" + to_string(phi_counter++);
-          auto alloca = make_unique<Alloc>(ptr_type, string(name), *size,
-                                           nullptr, align);
-
-          auto store = [&](auto *bb, const auto *val) {
-            bb->addInstrAt(make_unique<Store>(*alloca.get(),
-                                              *const_cast<Value*>(val), align),
-                           static_cast<const Instr*>(val), false);
-          };
-
-          store(bb_val, val);
-          for (auto &[bb, val] : copies) {
-            store(bb, val);
-          }
-
-          auto load
-            = make_unique<Load>(type, name + "#load", *alloca.get(), align);
+        // The merge phis above only repair the use if exactly one of them
+        // is used, it has an entry for every predecessor of its destination,
+        // and its destination dominates the use. Otherwise -- several
+        // dominating exits landing on different destinations, an exit
+        // destination with predecessors that are not copies of loop exits,
+        // or no dominating exit at all -- fall back to load/stores to avoid
+        // complex SSA building algorithms.
+        if (dynamic_cast<Instr*>(user) &&
+            (added_phis.size() != 1 ||
+             any_of(added_phis.begin(), added_phis.end(),
+                    [&](const auto &p) {
+                      auto srcs = p.second->sources();
+                      return any_of(preds[p.first].begin(),
+                                    preds[p.first].end(),
+                                    [&](const BasicBlock *pred) {
+                          return find(srcs.begin(), srcs.end(),
+                                      pred->getName()) == srcs.end();
+                        });
+                    }) ||
+             !dom_tree.dominates(added_phis.begin()->first, user_bb))) {
+          auto load = make_unique<Load>(val->getType(),
+                            val->getName() + "#ld#" + to_string(phi_counter++),
+                            get_exit_slot(), 16);
           auto *i = static_cast<Instr*>(user);
-          i->rauw(*first_added_phi, *load.get());
+          if (first_added_phi)
+            i->rauw(*first_added_phi, *load.get());
+          else
+            i->rauw(*val, *load.get());
           user_bb->addInstrAt(std::move(load), i, true);
-
-          getFirstBB().addInstr(std::move(alloca), true);
         }
       }
     }
